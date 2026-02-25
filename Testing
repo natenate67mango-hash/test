@@ -1,0 +1,839 @@
+-- Fix: use repeat/pcall-safe wait instead of bare task.wait()
+repeat pcall(function() task.wait() end) until game:IsLoaded()
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local SoundService     = game:GetService("SoundService")
+local Player           = Players.LocalPlayer
+
+-- =============================================
+-- CONFIG
+-- =============================================
+local CONFIG_FILE = "float_config.json"
+
+local function loadConfig()
+    local ok, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(readfile(CONFIG_FILE))
+    end)
+    if ok and type(data) == "table" then return data end
+    return {}
+end
+
+local function saveConfig(cfg)
+    pcall(function()
+        writefile(CONFIG_FILE, game:GetService("HttpService"):JSONEncode(cfg))
+    end)
+end
+
+local savedCfg = loadConfig()
+
+-- =============================================
+-- KEYBINDS
+-- =============================================
+local FLOAT_KEYBIND = Enum.KeyCode[savedCfg.floatKey or "G"] or Enum.KeyCode.G
+local DROP_KEYBIND  = Enum.KeyCode[savedCfg.dropKey  or "F"] or Enum.KeyCode.F
+
+-- =============================================
+-- FLOAT
+-- =============================================
+local floatEnabled = false
+local floatBodyPos = nil
+local floatGroundY = nil
+local floatConn    = nil
+local FloatOffset  = tonumber(savedCfg.floatOffset) or 18.0
+
+local function startFloat()
+    if floatConn then return end
+    local c = Player.Character
+    if not c then return end
+    local h   = c:FindFirstChild("HumanoidRootPart")
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    if not h or not hum then return end
+    floatGroundY = h.Position.Y
+    if floatBodyPos then floatBodyPos:Destroy() floatBodyPos = nil end
+    local old = h:FindFirstChild("FloatBodyPos")
+    if old then old:Destroy() end
+    pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Freefall,    false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp,   false)
+        hum.Health = hum.MaxHealth
+    end)
+    floatBodyPos          = Instance.new("BodyPosition")
+    floatBodyPos.Name     = "FloatBodyPos"
+    floatBodyPos.Position = Vector3.new(h.Position.X, floatGroundY + FloatOffset, h.Position.Z)
+    floatBodyPos.MaxForce = Vector3.new(0, math.huge, 0)
+    floatBodyPos.P        = 100000
+    floatBodyPos.D        = 1000
+    floatBodyPos.Parent   = h
+    floatConn = RunService.Heartbeat:Connect(function()
+        if not floatEnabled then return end
+        pcall(function()
+            local c3   = Player.Character
+            if not c3 then return end
+            local h3   = c3:FindFirstChild("HumanoidRootPart")
+            local hum3 = c3:FindFirstChildOfClass("Humanoid")
+            if not h3 then return end
+            if floatBodyPos and floatBodyPos.Parent then
+                floatBodyPos.Position = Vector3.new(h3.Position.X, floatGroundY + FloatOffset, h3.Position.Z)
+            end
+            if hum3 then
+                pcall(function()
+                    hum3:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+                    hum3:SetStateEnabled(Enum.HumanoidStateType.Freefall,    false)
+                    hum3.Health = hum3.MaxHealth
+                end)
+            end
+        end)
+    end)
+end
+
+local function stopFloat()
+    if floatConn    then floatConn:Disconnect()    floatConn    = nil end
+    if floatBodyPos then floatBodyPos:Destroy()    floatBodyPos = nil end
+    pcall(function()
+        local c   = Player.Character
+        if not c then return end
+        local h   = c:FindFirstChild("HumanoidRootPart")
+        local hum = c:FindFirstChildOfClass("Humanoid")
+        local old = h and h:FindFirstChild("FloatBodyPos")
+        if old then old:Destroy() end
+        if hum then
+            pcall(function()
+                hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+                hum:SetStateEnabled(Enum.HumanoidStateType.Freefall,    false)
+                hum.Health = hum.MaxHealth
+            end)
+        end
+        if h and floatGroundY then
+            h.AssemblyLinearVelocity = Vector3.new(0,0,0)
+            h.CFrame = CFrame.new(h.Position.X, floatGroundY, h.Position.Z) * (h.CFrame - h.CFrame.Position)
+        end
+    end)
+    floatGroundY = nil
+    task.delay(1, function()
+        local c = Player.Character
+        if not c or floatEnabled then return end
+        local hum = c:FindFirstChildOfClass("Humanoid")
+        if not hum then return end
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Freefall,    true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp,   true)
+        end)
+    end)
+end
+
+-- =============================================
+-- BOX ESP
+-- Draws a 2D screen-space box around every other
+-- player using their HumanoidRootPart world pos,
+-- projected through the camera each frame.
+-- Works even if their character is invisible or
+-- swapped to a custom model.
+-- =============================================
+local espEnabled = savedCfg.espEnabled == true
+local espBoxes   = {}   -- [Player] = {gui, box, nameLabel}
+local espConn    = nil
+
+-- We parent all ESP gui elements to a single ScreenGui
+local espSg = Instance.new("ScreenGui")
+espSg.Name          = "ESP_BoxGui"
+espSg.ResetOnSpawn  = false
+espSg.IgnoreGuiInset = true
+espSg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+espSg.Parent        = Player.PlayerGui
+
+local ESP_COLOR     = Color3.fromRGB(0, 140, 255)   -- base blue
+local ESP_COL_WHITE = Color3.fromRGB(255, 255, 255) -- chaser highlight
+local BOX_THICKNESS = 2   -- px
+local CHASE_SPEED   = 1.2 -- full loop per second
+
+-- Fixed-size world-space box around the player's actual standing position (feet to head).
+-- Uses HumanoidRootPart + humanoid height so the box stays a constant size regardless
+-- of animation, accessories, or tool positions.
+local ESP_BOX_HALF_W = 1.5   -- half-width in studs
+local ESP_BOX_FOOT_OFF = -3.2 -- offset below HRP to feet
+local ESP_BOX_HEAD_OFF =  3.2 -- offset above HRP to head
+
+local function getScreenBounds(char)
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local base = hrp.Position
+    -- 4 bottom corners + 4 top corners of a fixed world-space box
+    local corners = {
+        base + Vector3.new(-ESP_BOX_HALF_W, ESP_BOX_FOOT_OFF, -ESP_BOX_HALF_W),
+        base + Vector3.new( ESP_BOX_HALF_W, ESP_BOX_FOOT_OFF, -ESP_BOX_HALF_W),
+        base + Vector3.new(-ESP_BOX_HALF_W, ESP_BOX_FOOT_OFF,  ESP_BOX_HALF_W),
+        base + Vector3.new( ESP_BOX_HALF_W, ESP_BOX_FOOT_OFF,  ESP_BOX_HALF_W),
+        base + Vector3.new(-ESP_BOX_HALF_W, ESP_BOX_HEAD_OFF, -ESP_BOX_HALF_W),
+        base + Vector3.new( ESP_BOX_HALF_W, ESP_BOX_HEAD_OFF, -ESP_BOX_HALF_W),
+        base + Vector3.new(-ESP_BOX_HALF_W, ESP_BOX_HEAD_OFF,  ESP_BOX_HALF_W),
+        base + Vector3.new( ESP_BOX_HALF_W, ESP_BOX_HEAD_OFF,  ESP_BOX_HALF_W),
+    }
+
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local allBehind  = true
+
+    for _, worldPos in ipairs(corners) do
+        local screenPos, inView = cam:WorldToViewportPoint(worldPos)
+        if inView then
+            allBehind = false
+            minX = math.min(minX, screenPos.X)
+            minY = math.min(minY, screenPos.Y)
+            maxX = math.max(maxX, screenPos.X)
+            maxY = math.max(maxY, screenPos.Y)
+        end
+    end
+
+    if allBehind or minX == math.huge then return nil end
+    return minX, minY, maxX, maxY
+end
+
+local function getEspTarget(plr)
+    -- First try .Character, then scan workspace for any model named after the player
+    local char = plr.Character
+    if char and char.Parent then return char end
+    -- fallback scan
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA("Model") and obj.Name == plr.Name and obj ~= Player.Character then
+            return obj
+        end
+    end
+    return nil
+end
+
+-- Number of segments per side for the chaser effect
+local SEG_COUNT = 12
+
+local function createBoxFor(plr)
+    if plr == Player then return end
+    if espBoxes[plr] then return end
+
+    -- Container frame (transparent, full screen, pixel-positioned each frame)
+    local holder = Instance.new("Frame", espSg)
+    holder.Name              = "ESP_" .. plr.Name
+    holder.BackgroundTransparency = 1
+    holder.Size              = UDim2.new(0, 100, 0, 100)
+    holder.Position          = UDim2.new(0, 0, 0, 0)
+    holder.BorderSizePixel   = 0
+    holder.ZIndex            = 10
+
+    -- 4 sides x SEG_COUNT segments each
+    -- sides: 1=Top, 2=Right, 3=Bottom, 4=Left  (clockwise)
+    local segs = {}  -- segs[side][seg] = Frame
+    for side = 1, 4 do
+        segs[side] = {}
+        for s = 1, SEG_COUNT do
+            local f = Instance.new("Frame", holder)
+            f.BackgroundColor3 = ESP_COLOR
+            f.BorderSizePixel  = 0
+            f.ZIndex           = 11
+            segs[side][s] = f
+        end
+    end
+
+    -- Name label above the box
+    local nameLbl = Instance.new("TextLabel", holder)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Text       = plr.Name
+    nameLbl.TextColor3 = ESP_COLOR
+    nameLbl.Font       = Enum.Font.GothamBold
+    nameLbl.TextSize   = 12
+    nameLbl.TextStrokeTransparency = 0.4
+    nameLbl.TextStrokeColor3 = Color3.new(0,0,0)
+    nameLbl.ZIndex     = 12
+    nameLbl.Size       = UDim2.new(0, 120, 0, 16)
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Center
+
+    espBoxes[plr] = { holder = holder, segs = segs, nameLabel = nameLbl, timeOffset = math.random() }
+end
+
+local function removeBoxFor(plr)
+    if espBoxes[plr] then
+        pcall(function() espBoxes[plr].holder:Destroy() end)
+        espBoxes[plr] = nil
+    end
+end
+
+local function enableEsp()
+    -- Create boxes for all current players
+    for _, plr in ipairs(Players:GetPlayers()) do
+        createBoxFor(plr)
+    end
+    -- Update loop: runs every frame to reposition boxes + animate chaser
+    if espConn then espConn:Disconnect() espConn = nil end
+    espConn = RunService.RenderStepped:Connect(function()
+        if not espEnabled then return end
+        local now = tick()
+        for plr, data in pairs(espBoxes) do
+            pcall(function()
+                local char = getEspTarget(plr)
+                if not char then
+                    data.holder.Visible = false
+                    return
+                end
+
+                local minX, minY, maxX, maxY = getScreenBounds(char)
+                if not minX then
+                    data.holder.Visible = false
+                    return
+                end
+
+                local w = maxX - minX
+                local h = maxY - minY
+                if w < 2 or h < 2 then
+                    data.holder.Visible = false
+                    return
+                end
+
+                data.holder.Visible  = true
+                data.holder.Position = UDim2.new(0, minX, 0, minY)
+                data.holder.Size     = UDim2.new(0, w, 0, h)
+
+                local tk  = BOX_THICKNESS
+                local n   = SEG_COUNT
+                local segs = data.segs
+
+                -- Layout segments for each side (clockwise: Top, Right, Bottom, Left)
+                -- Top: left→right
+                for s = 1, n do
+                    local f = segs[1][s]
+                    f.Position = UDim2.new((s-1)/n, 0,       0, 0)
+                    f.Size     = UDim2.new(1/n,     0,       0, tk)
+                end
+                -- Right: top→bottom
+                for s = 1, n do
+                    local f = segs[2][s]
+                    f.Position = UDim2.new(1, -tk,   (s-1)/n, 0)
+                    f.Size     = UDim2.new(0,  tk,   1/n,     0)
+                end
+                -- Bottom: right→left
+                for s = 1, n do
+                    local f = segs[3][s]
+                    f.Position = UDim2.new(1 - s/n,  0,  1, -tk)
+                    f.Size     = UDim2.new(1/n,      0,  0,  tk)
+                end
+                -- Left: bottom→top
+                for s = 1, n do
+                    local f = segs[4][s]
+                    f.Position = UDim2.new(0, 0,  1 - s/n,  0)
+                    f.Size     = UDim2.new(0, tk, 1/n,      0)
+                end
+
+                -- Chaser: white spot travels clockwise through all 4*n segments
+                -- Total segments around the perimeter = 4*n
+                local totalSegs = 4 * n
+                -- chaser head position in [0, totalSegs), advancing with time
+                local headPos = (now * CHASE_SPEED * totalSegs + data.timeOffset * totalSegs) % totalSegs
+
+                -- Pulse half-width in segments
+                local pulseWidth = totalSegs * 0.12  -- ~12% of perimeter
+
+                for side = 1, 4 do
+                    for s = 1, n do
+                        -- Global segment index (0-based)
+                        local gi = (side - 1) * n + (s - 1)
+                        -- Distance from chaser head (wrapping)
+                        local d  = math.abs(gi - headPos)
+                        d = math.min(d, totalSegs - d)
+                        local alpha = math.max(0, 1 - (d / pulseWidth)) ^ 2
+                        segs[side][s].BackgroundColor3 = ESP_COLOR:Lerp(ESP_COL_WHITE, alpha)
+                    end
+                end
+
+                -- Name label pulses white when chaser is near segment 0 (top-left corner)
+                local d0 = math.min(headPos, totalSegs - headPos)
+                local lblAlpha = math.max(0, 1 - (d0 / pulseWidth)) ^ 2
+                data.nameLabel.TextColor3 = ESP_COLOR:Lerp(ESP_COL_WHITE, lblAlpha)
+                data.nameLabel.Position   = UDim2.new(0.5, -60, 0, -18)
+            end)
+        end
+    end)
+end
+
+local function disableEsp()
+    if espConn then espConn:Disconnect() espConn = nil end
+    for plr, _ in pairs(espBoxes) do
+        removeBoxFor(plr)
+    end
+end
+
+-- Hook new players joining
+Players.PlayerAdded:Connect(function(plr)
+    if espEnabled then createBoxFor(plr) end
+    plr.CharacterAdded:Connect(function()
+        -- box already exists, it'll pick up new character on next frame
+    end)
+end)
+Players.PlayerRemoving:Connect(function(plr)
+    removeBoxFor(plr)
+end)
+
+-- Character respawn
+Player.CharacterAdded:Connect(function()
+    task.wait(1)
+    if floatBodyPos then floatBodyPos:Destroy() floatBodyPos = nil end
+    floatGroundY = nil
+    if floatEnabled then stopFloat() task.wait(0.1) startFloat() end
+end)
+
+-- Apply saved on load
+if savedCfg.floatEnabled then
+    floatEnabled = true
+    task.delay(2, function() if floatEnabled then startFloat() end end)
+end
+if espEnabled then
+    task.delay(2, function() if espEnabled then enableEsp() end end)
+end
+
+-- =============================================
+-- GUI
+-- =============================================
+task.spawn(function()
+
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local guiScale = isMobile and 2 or 1
+
+local C = {
+    purple = Color3.fromRGB(155, 70, 255),
+    green  = Color3.fromRGB(60, 220, 120),
+    teal   = Color3.fromRGB(40, 210, 180),
+}
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "TreeDuels_Float"
+sg.ResetOnSpawn = false
+sg.IgnoreGuiInset = true
+sg.Parent = Player.PlayerGui
+
+local function playSound(id, vol, spd)
+    pcall(function()
+        local s = Instance.new("Sound", SoundService)
+        s.SoundId = id s.Volume = vol or 0.3 s.PlaybackSpeed = spd or 1
+        s:Play() game:GetService("Debris"):AddItem(s, 1)
+    end)
+end
+
+-- =============================================
+-- PANEL
+-- =============================================
+local TITLE_H = 38
+local PANEL_H = 360
+local collapsed = false
+
+local panel = Instance.new("Frame", sg)
+panel.Name = "FloatPanel"
+panel.Size = UDim2.new(0, 360*guiScale, 0, PANEL_H*guiScale)
+panel.Position = UDim2.new(0.5, -180*guiScale, 0.5, -(PANEL_H/2)*guiScale)
+panel.BackgroundColor3 = Color3.fromRGB(8, 2, 18)
+panel.BackgroundTransparency = 0.08
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Draggable = true
+panel.ClipsDescendants = true
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 14*guiScale)
+
+local stroke = Instance.new("UIStroke", panel)
+stroke.Thickness = 1.8
+local strokeGrad = Instance.new("UIGradient", stroke)
+strokeGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(160,60,255)),
+    ColorSequenceKeypoint.new(0.2, Color3.fromRGB(60,160,255)),
+    ColorSequenceKeypoint.new(0.4, Color3.fromRGB(255,80,200)),
+    ColorSequenceKeypoint.new(0.6, Color3.fromRGB(80,220,255)),
+    ColorSequenceKeypoint.new(0.8, Color3.fromRGB(200,80,255)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(160,60,255)),
+})
+task.spawn(function()
+    local r = 0
+    while panel.Parent do r=(r+2)%360 strokeGrad.Rotation=r task.wait(0.016) end
+end)
+
+local bg = Instance.new("UIGradient", panel)
+bg.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0,    Color3.fromRGB(18,4,38)),
+    ColorSequenceKeypoint.new(0.45, Color3.fromRGB(12,2,28)),
+    ColorSequenceKeypoint.new(1,    Color3.fromRGB(6,0,20))
+}
+bg.Rotation = 135
+
+local shimmer = Instance.new("Frame", panel)
+shimmer.Size=UDim2.new(0.7,0,0,1) shimmer.Position=UDim2.new(0.15,0,0,2)
+shimmer.BackgroundColor3=Color3.fromRGB(255,255,255) shimmer.BackgroundTransparency=0.7
+shimmer.BorderSizePixel=0 shimmer.ZIndex=8
+Instance.new("UICorner",shimmer).CornerRadius=UDim.new(1,0)
+local shimGrad=Instance.new("UIGradient",shimmer)
+shimGrad.Transparency=NumberSequence.new{NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(0.5,0),NumberSequenceKeypoint.new(1,1)}
+
+local starLayer=Instance.new("Frame",panel)
+starLayer.Size=UDim2.new(1,0,1,0) starLayer.BackgroundTransparency=1 starLayer.ZIndex=1
+for i=1,20 do
+    local s=Instance.new("Frame",starLayer)
+    s.Size=UDim2.new(0,math.random(1,2),0,math.random(1,2))
+    s.Position=UDim2.new(math.random(),0,math.random(),0)
+    s.BackgroundColor3=Color3.fromRGB(math.random(180,255),math.random(160,210),255)
+    s.BackgroundTransparency=math.random()*0.5+0.3 s.BorderSizePixel=0
+    Instance.new("UICorner",s).CornerRadius=UDim.new(1,0)
+end
+
+-- =============================================
+-- TITLEBAR
+-- =============================================
+local titleBar=Instance.new("Frame",panel)
+titleBar.Size=UDim2.new(1,0,0,TITLE_H*guiScale)
+titleBar.BackgroundTransparency=1 titleBar.ZIndex=10 titleBar.Active=true
+
+local titleLbl=Instance.new("TextLabel",titleBar)
+titleLbl.Size=UDim2.new(1,-90*guiScale,1,0) titleLbl.Position=UDim2.new(0,12*guiScale,0,0)
+titleLbl.BackgroundTransparency=1 titleLbl.Text="🪐  FLOAT"
+titleLbl.TextColor3=Color3.fromRGB(235,215,255) titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.TextSize=math.max(11,math.floor(17*guiScale))
+titleLbl.TextXAlignment=Enum.TextXAlignment.Left titleLbl.TextYAlignment=Enum.TextYAlignment.Center titleLbl.ZIndex=11
+local tg=Instance.new("UIGradient",titleLbl)
+tg.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(230,190,255)),ColorSequenceKeypoint.new(1,Color3.fromRGB(130,200,255))}
+tg.Rotation=90
+
+local collapseBtn=Instance.new("TextButton",titleBar)
+collapseBtn.Size=UDim2.new(0,26*guiScale,0,26*guiScale) collapseBtn.Position=UDim2.new(1,-62*guiScale,0.5,-13*guiScale)
+collapseBtn.BackgroundColor3=Color3.fromRGB(40,15,60) collapseBtn.BackgroundTransparency=0.4
+collapseBtn.Text="▼" collapseBtn.TextColor3=Color3.fromRGB(180,140,220)
+collapseBtn.Font=Enum.Font.GothamBold collapseBtn.TextSize=math.max(9,math.floor(12*guiScale)) collapseBtn.ZIndex=12
+Instance.new("UICorner",collapseBtn).CornerRadius=UDim.new(1,0)
+collapseBtn.MouseEnter:Connect(function() collapseBtn.BackgroundTransparency=0.1 end)
+collapseBtn.MouseLeave:Connect(function() collapseBtn.BackgroundTransparency=0.4 end)
+
+local closeBtn=Instance.new("TextButton",titleBar)
+closeBtn.Size=UDim2.new(0,26*guiScale,0,26*guiScale) closeBtn.Position=UDim2.new(1,-32*guiScale,0.5,-13*guiScale)
+closeBtn.BackgroundColor3=Color3.fromRGB(40,15,55) closeBtn.BackgroundTransparency=0.4
+closeBtn.Text="✕" closeBtn.TextColor3=Color3.fromRGB(180,140,220)
+closeBtn.Font=Enum.Font.GothamBold closeBtn.TextSize=math.max(9,math.floor(12*guiScale)) closeBtn.ZIndex=12
+Instance.new("UICorner",closeBtn).CornerRadius=UDim.new(1,0)
+closeBtn.MouseButton1Click:Connect(function() panel.Visible=false end)
+closeBtn.MouseEnter:Connect(function() closeBtn.TextColor3=Color3.fromRGB(255,80,100) closeBtn.BackgroundTransparency=0.1 end)
+closeBtn.MouseLeave:Connect(function() closeBtn.TextColor3=Color3.fromRGB(180,140,220) closeBtn.BackgroundTransparency=0.4 end)
+
+local titleLine=Instance.new("Frame",panel)
+titleLine.Size=UDim2.new(0.9,0,0,1) titleLine.Position=UDim2.new(0.05,0,0,TITLE_H*guiScale)
+titleLine.BackgroundTransparency=0.5 titleLine.BorderSizePixel=0 titleLine.ZIndex=9
+local lg=Instance.new("UIGradient",titleLine)
+lg.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(180,80,255)),ColorSequenceKeypoint.new(0.5,Color3.fromRGB(80,180,255)),ColorSequenceKeypoint.new(1,Color3.fromRGB(180,80,255))}
+lg.Transparency=NumberSequence.new{NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(0.5,0),NumberSequenceKeypoint.new(1,1)}
+
+collapseBtn.MouseButton1Click:Connect(function()
+    collapsed=not collapsed collapseBtn.Text=collapsed and "▲" or "▼"
+    TweenService:Create(panel,TweenInfo.new(0.22,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{
+        Size=UDim2.new(0,360*guiScale,0,(collapsed and TITLE_H or PANEL_H)*guiScale)
+    }):Play()
+    playSound("rbxassetid://6895079813",0.25,collapsed and 0.9 or 1.1)
+end)
+
+-- =============================================
+-- CONTENT
+-- =============================================
+local content=Instance.new("Frame",panel)
+content.Size=UDim2.new(1,-16*guiScale,1,-(TITLE_H+6)*guiScale)
+content.Position=UDim2.new(0,8*guiScale,0,(TITLE_H+4)*guiScale)
+content.BackgroundTransparency=1
+
+-- =============================================
+-- HELPER: toggle row
+-- =============================================
+local function makeToggleRow(parent, yOff, labelTxt, accentColor, defaultOn)
+    local ac=accentColor or Color3.fromRGB(170,90,255)
+    local isOn=defaultOn==true
+
+    local r=Instance.new("Frame",parent)
+    r.Size=UDim2.new(1,-8*guiScale,0,44*guiScale) r.Position=UDim2.new(0,4*guiScale,0,yOff)
+    r.BackgroundColor3=Color3.fromRGB(22,8,40) r.BackgroundTransparency=0.4
+    r.BorderSizePixel=0 r.ZIndex=4
+    Instance.new("UICorner",r).CornerRadius=UDim.new(0,10*guiScale)
+    local rs=Instance.new("UIStroke",r)
+    rs.Color=isOn and ac or Color3.fromRGB(80,40,120) rs.Thickness=1 rs.Transparency=isOn and 0.2 or 0.7
+
+    local kb=Instance.new("TextButton",r)
+    kb.Size=UDim2.new(0,38*guiScale,0,22*guiScale) kb.Position=UDim2.new(0,6*guiScale,0.5,-11*guiScale)
+    kb.BackgroundColor3=Color3.fromRGB(50,20,80) kb.BackgroundTransparency=0.4
+    kb.Text="–" kb.TextColor3=Color3.fromRGB(200,160,255)
+    kb.Font=Enum.Font.GothamBold kb.TextSize=9*guiScale kb.ZIndex=6
+    Instance.new("UICorner",kb).CornerRadius=UDim.new(0,6*guiScale)
+    local ks=Instance.new("UIStroke",kb) ks.Color=Color3.fromRGB(140,80,220) ks.Thickness=1 ks.Transparency=0.3
+
+    local lbl=Instance.new("TextLabel",r)
+    lbl.Size=UDim2.new(1,-140*guiScale,1,0) lbl.Position=UDim2.new(0,50*guiScale,0,0)
+    lbl.BackgroundTransparency=1 lbl.Text=labelTxt
+    lbl.TextColor3=Color3.fromRGB(230,210,255) lbl.Font=Enum.Font.GothamBold
+    lbl.TextSize=13*guiScale lbl.TextXAlignment=Enum.TextXAlignment.Center
+    lbl.TextYAlignment=Enum.TextYAlignment.Center lbl.ZIndex=5
+
+    local tbg=Instance.new("Frame",r)
+    tbg.Size=UDim2.new(0,46*guiScale,0,24*guiScale) tbg.Position=UDim2.new(1,-52*guiScale,0.5,-12*guiScale)
+    tbg.BackgroundColor3=isOn and ac or Color3.fromRGB(25,12,38) tbg.ZIndex=5
+    Instance.new("UICorner",tbg).CornerRadius=UDim.new(1,0)
+    local ts=Instance.new("UIStroke",tbg)
+    ts.Color=isOn and ac or Color3.fromRGB(80,40,120) ts.Thickness=1 ts.Transparency=isOn and 0 or 0.5
+
+    local tc=Instance.new("Frame",tbg)
+    tc.Size=UDim2.new(0,18*guiScale,0,18*guiScale)
+    tc.Position=isOn and UDim2.new(1,-21*guiScale,0.5,-9*guiScale) or UDim2.new(0,3*guiScale,0.5,-9*guiScale)
+    tc.BackgroundColor3=Color3.new(1,1,1) tc.ZIndex=6
+    Instance.new("UICorner",tc).CornerRadius=UDim.new(1,0)
+
+    local cb=Instance.new("TextButton",r)
+    cb.Size=UDim2.new(1,-50*guiScale,1,0) cb.Position=UDim2.new(0,50*guiScale,0,0)
+    cb.BackgroundTransparency=1 cb.Text="" cb.ZIndex=7
+    cb.MouseEnter:Connect(function() TweenService:Create(r,TweenInfo.new(0.12),{BackgroundTransparency=0.15}):Play() end)
+    cb.MouseLeave:Connect(function() TweenService:Create(r,TweenInfo.new(0.12),{BackgroundTransparency=0.4}):Play() end)
+
+    local function setVis(state)
+        isOn=state
+        local col=isOn and ac or Color3.fromRGB(25,12,38)
+        TweenService:Create(tbg,TweenInfo.new(0.2,Enum.EasingStyle.Quad),{BackgroundColor3=col}):Play()
+        TweenService:Create(ts,TweenInfo.new(0.2),{Color=isOn and ac or Color3.fromRGB(80,40,120),Transparency=isOn and 0 or 0.5}):Play()
+        TweenService:Create(rs,TweenInfo.new(0.2),{Color=isOn and ac or Color3.fromRGB(80,40,120),Transparency=isOn and 0.2 or 0.7}):Play()
+        TweenService:Create(tc,TweenInfo.new(0.22,Enum.EasingStyle.Back),{
+            Position=isOn and UDim2.new(1,-21*guiScale,0.5,-9*guiScale) or UDim2.new(0,3*guiScale,0.5,-9*guiScale)
+        }):Play()
+    end
+
+    return {row=r,keyBtn=kb,clickBtn=cb,setVisual=setVis,getOn=function() return isOn end}
+end
+
+-- =============================================
+-- Y POSITIONS
+-- =============================================
+local Y = {
+    floatRow    = 0,
+    offsetRow   = 50,
+    floatSlider = 86,
+    dropRow     = 152,
+    espRow      = 200,
+    saveBtn     = 252,
+    savedLbl    = 292,
+}
+
+-- =============================================
+-- FLOAT TOGGLE ROW
+-- =============================================
+local floatIsOn = savedCfg.floatEnabled == true
+local waitingForFloatKey = false
+local floatUI = makeToggleRow(content, Y.floatRow, "Float", Color3.fromRGB(170,90,255), floatIsOn)
+floatUI.keyBtn.Text = FLOAT_KEYBIND.Name
+
+floatUI.keyBtn.MouseButton1Click:Connect(function()
+    waitingForFloatKey=true floatUI.keyBtn.Text="..." floatUI.keyBtn.TextColor3=Color3.fromRGB(255,220,80)
+    playSound("rbxassetid://6895079813",0.3,1.5)
+end)
+floatUI.keyBtn.MouseEnter:Connect(function() if not waitingForFloatKey then TweenService:Create(floatUI.keyBtn,TweenInfo.new(0.1),{BackgroundTransparency=0}):Play() end end)
+floatUI.keyBtn.MouseLeave:Connect(function() if not waitingForFloatKey then TweenService:Create(floatUI.keyBtn,TweenInfo.new(0.1),{BackgroundTransparency=0.4}):Play() end end)
+floatUI.clickBtn.MouseButton1Click:Connect(function()
+    local ns=not floatIsOn floatEnabled=ns floatUI.setVisual(ns) floatIsOn=ns
+    if ns then startFloat() else stopFloat() end
+    playSound("rbxassetid://6895079813",0.4,1)
+end)
+
+-- =============================================
+-- FLOAT OFFSET BOX + SLIDER
+-- =============================================
+local trackFillRef, thumbRef, sValLblRef
+
+local function syncFloat(val)
+    val=math.clamp(math.floor(val*10+0.5)/10,1,100)
+    FloatOffset=val
+    local p=(val-1)/99
+    if trackFillRef then trackFillRef.Size=UDim2.new(p,0,1,0) end
+    if thumbRef     then thumbRef.Position=UDim2.new(p,-7*guiScale,0.5,-7*guiScale) end
+    if sValLblRef   then sValLblRef.Text=string.format("%.1f",val) end
+end
+
+local offsetRow=Instance.new("Frame",content)
+offsetRow.Size=UDim2.new(1,-8*guiScale,0,30*guiScale) offsetRow.Position=UDim2.new(0,4*guiScale,0,Y.offsetRow)
+offsetRow.BackgroundColor3=Color3.fromRGB(22,8,40) offsetRow.BackgroundTransparency=0.4
+offsetRow.BorderSizePixel=0 offsetRow.ZIndex=4
+Instance.new("UICorner",offsetRow).CornerRadius=UDim.new(0,8*guiScale)
+Instance.new("UIStroke",offsetRow).Color=Color3.fromRGB(80,40,120)
+
+local ol=Instance.new("TextLabel",offsetRow)
+ol.Size=UDim2.new(0.45,0,1,0) ol.Position=UDim2.new(0,8*guiScale,0,0) ol.BackgroundTransparency=1
+ol.Text="Offset" ol.TextColor3=Color3.fromRGB(180,150,220) ol.Font=Enum.Font.GothamBold
+ol.TextSize=11*guiScale ol.TextXAlignment=Enum.TextXAlignment.Left ol.TextYAlignment=Enum.TextYAlignment.Center ol.ZIndex=5
+
+local offsetBox=Instance.new("TextBox",offsetRow)
+offsetBox.Size=UDim2.new(0.48,0,0,22*guiScale) offsetBox.Position=UDim2.new(0.5,0,0.5,-11*guiScale)
+offsetBox.BackgroundColor3=Color3.fromRGB(40,18,60) offsetBox.Text=string.format("%.1f",FloatOffset)
+offsetBox.TextColor3=Color3.fromRGB(200,160,255) offsetBox.Font=Enum.Font.GothamBold
+offsetBox.TextSize=11*guiScale offsetBox.TextXAlignment=Enum.TextXAlignment.Center
+offsetBox.ClearTextOnFocus=false offsetBox.ZIndex=6
+Instance.new("UICorner",offsetBox).CornerRadius=UDim.new(0,6*guiScale)
+local obs=Instance.new("UIStroke",offsetBox) obs.Color=Color3.fromRGB(140,80,220) obs.Thickness=1 obs.Transparency=0.3
+offsetBox.Focused:Connect(function() TweenService:Create(obs,TweenInfo.new(0.15),{Transparency=0,Color=Color3.fromRGB(180,100,255)}):Play() end)
+offsetBox.FocusLost:Connect(function()
+    TweenService:Create(obs,TweenInfo.new(0.15),{Transparency=0.3,Color=Color3.fromRGB(140,80,220)}):Play()
+    local n=tonumber(offsetBox.Text) if n then syncFloat(n) end
+    offsetBox.Text=string.format("%.1f",FloatOffset)
+end)
+
+local fhsc=Instance.new("Frame",content)
+fhsc.Size=UDim2.new(1,-8*guiScale,0,58*guiScale) fhsc.Position=UDim2.new(0,4*guiScale,0,Y.floatSlider)
+fhsc.BackgroundColor3=Color3.fromRGB(18,6,32) fhsc.BackgroundTransparency=0.5
+fhsc.BorderSizePixel=0 fhsc.ZIndex=4
+Instance.new("UICorner",fhsc).CornerRadius=UDim.new(0,10*guiScale)
+Instance.new("UIStroke",fhsc).Color=Color3.fromRGB(80,40,120)
+local fhl=Instance.new("TextLabel",fhsc) fhl.Size=UDim2.new(1,-60*guiScale,0,22*guiScale) fhl.Position=UDim2.new(0,8*guiScale,0,4*guiScale)
+fhl.BackgroundTransparency=1 fhl.Text="Float Height" fhl.TextColor3=Color3.fromRGB(210,185,255)
+fhl.Font=Enum.Font.GothamBold fhl.TextSize=12*guiScale fhl.TextXAlignment=Enum.TextXAlignment.Left fhl.ZIndex=5
+local fhv=Instance.new("TextLabel",fhsc) fhv.Size=UDim2.new(0,50*guiScale,0,22*guiScale) fhv.Position=UDim2.new(1,-54*guiScale,0,4*guiScale)
+fhv.BackgroundTransparency=1 fhv.Text=string.format("%.1f",FloatOffset) fhv.TextColor3=Color3.fromRGB(160,110,220)
+fhv.Font=Enum.Font.GothamBold fhv.TextSize=12*guiScale fhv.TextXAlignment=Enum.TextXAlignment.Right fhv.ZIndex=5
+sValLblRef=fhv
+local fhtb=Instance.new("Frame",fhsc) fhtb.Size=UDim2.new(1,-16*guiScale,0,8*guiScale) fhtb.Position=UDim2.new(0,8*guiScale,0,36*guiScale)
+fhtb.BackgroundColor3=Color3.fromRGB(35,15,55) fhtb.ZIndex=5 Instance.new("UICorner",fhtb).CornerRadius=UDim.new(1,0)
+local fhp=(FloatOffset-1)/99
+local fhtf=Instance.new("Frame",fhtb) fhtf.Size=UDim2.new(fhp,0,1,0) fhtf.BackgroundColor3=Color3.fromRGB(155,70,255) fhtf.ZIndex=6
+Instance.new("UICorner",fhtf).CornerRadius=UDim.new(1,0)
+local fhtfg=Instance.new("UIGradient",fhtf) fhtfg.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(140,60,255)),ColorSequenceKeypoint.new(1,Color3.fromRGB(80,180,255))}
+trackFillRef=fhtf
+local fhth=Instance.new("Frame",fhtb) fhth.Size=UDim2.new(0,14*guiScale,0,14*guiScale) fhth.Position=UDim2.new(fhp,-7*guiScale,0.5,-7*guiScale)
+fhth.BackgroundColor3=Color3.new(1,1,1) fhth.ZIndex=7 Instance.new("UICorner",fhth).CornerRadius=UDim.new(1,0) thumbRef=fhth
+local fhtbtn=Instance.new("TextButton",fhtb) fhtbtn.Size=UDim2.new(1,0,5,-20*guiScale) fhtbtn.Position=UDim2.new(0,0,-2,10*guiScale)
+fhtbtn.BackgroundTransparency=1 fhtbtn.Text="" fhtbtn.ZIndex=8
+local fhDrag=false
+fhtbtn.MouseButton1Down:Connect(function() fhDrag=true end)
+UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then fhDrag=false end end)
+UserInputService.InputChanged:Connect(function(i)
+    if fhDrag and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+        syncFloat(1+math.clamp((i.Position.X-fhtb.AbsolutePosition.X)/fhtb.AbsoluteSize.X,0,1)*99)
+        offsetBox.Text=string.format("%.1f",FloatOffset)
+    end
+end)
+fhtbtn.MouseButton1Click:Connect(function()
+    local mp=UserInputService:GetMouseLocation()
+    syncFloat(1+math.clamp((mp.X-fhtb.AbsolutePosition.X)/fhtb.AbsoluteSize.X,0,1)*99)
+    offsetBox.Text=string.format("%.1f",FloatOffset)
+end)
+
+-- =============================================
+-- DROP BRAINROT ROW
+-- =============================================
+local waitingForDropKey=false
+
+local dropRow=Instance.new("Frame",content)
+dropRow.Size=UDim2.new(1,-8*guiScale,0,40*guiScale) dropRow.Position=UDim2.new(0,4*guiScale,0,Y.dropRow)
+dropRow.BackgroundColor3=Color3.fromRGB(90,20,120) dropRow.BackgroundTransparency=0.1
+dropRow.BorderSizePixel=0 dropRow.ZIndex=5
+Instance.new("UICorner",dropRow).CornerRadius=UDim.new(0,10*guiScale)
+local drs=Instance.new("UIStroke",dropRow) drs.Color=Color3.fromRGB(220,80,255) drs.Thickness=1.5 drs.Transparency=0.2
+local drg=Instance.new("UIGradient",dropRow) drg.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(120,30,160)),ColorSequenceKeypoint.new(1,Color3.fromRGB(70,10,100))} drg.Rotation=90
+
+local dropKeyBtn=Instance.new("TextButton",dropRow)
+dropKeyBtn.Size=UDim2.new(0,38*guiScale,0,22*guiScale) dropKeyBtn.Position=UDim2.new(0,6*guiScale,0.5,-11*guiScale)
+dropKeyBtn.BackgroundColor3=Color3.fromRGB(60,10,90) dropKeyBtn.BackgroundTransparency=0.2
+dropKeyBtn.Text=DROP_KEYBIND.Name dropKeyBtn.TextColor3=Color3.fromRGB(240,180,255)
+dropKeyBtn.Font=Enum.Font.GothamBold dropKeyBtn.TextSize=9*guiScale dropKeyBtn.ZIndex=7
+Instance.new("UICorner",dropKeyBtn).CornerRadius=UDim.new(0,6*guiScale)
+local dks=Instance.new("UIStroke",dropKeyBtn) dks.Color=Color3.fromRGB(200,80,255) dks.Thickness=1 dks.Transparency=0.2
+dropKeyBtn.MouseButton1Click:Connect(function() waitingForDropKey=true dropKeyBtn.Text="..." dropKeyBtn.TextColor3=Color3.fromRGB(255,220,80) playSound("rbxassetid://6895079813",0.3,1.5) end)
+dropKeyBtn.MouseEnter:Connect(function() if not waitingForDropKey then TweenService:Create(dropKeyBtn,TweenInfo.new(0.1),{BackgroundTransparency=0}):Play() end end)
+dropKeyBtn.MouseLeave:Connect(function() if not waitingForDropKey then TweenService:Create(dropKeyBtn,TweenInfo.new(0.1),{BackgroundTransparency=0.2}):Play() end end)
+
+local dropBtn=Instance.new("TextButton",dropRow)
+dropBtn.Size=UDim2.new(1,-54*guiScale,1,0) dropBtn.Position=UDim2.new(0,50*guiScale,0,0)
+dropBtn.BackgroundTransparency=1 dropBtn.Text="🧠  Drop Brainrot"
+dropBtn.TextColor3=Color3.fromRGB(255,210,255) dropBtn.Font=Enum.Font.GothamBlack
+dropBtn.TextSize=13*guiScale dropBtn.TextXAlignment=Enum.TextXAlignment.Center dropBtn.ZIndex=6
+task.spawn(function() local t=0 while dropRow.Parent do t=t+0.05 drs.Transparency=0.05+((math.sin(t)+1)/2)*0.35 task.wait(0.03) end end)
+dropBtn.MouseEnter:Connect(function() TweenService:Create(dropRow,TweenInfo.new(0.1),{BackgroundTransparency=0}):Play() end)
+dropBtn.MouseLeave:Connect(function() TweenService:Create(dropRow,TweenInfo.new(0.1),{BackgroundTransparency=0.1}):Play() end)
+
+local function fireDrop()
+    playSound("rbxassetid://6895079813",0.6,0.8)
+    TweenService:Create(dropRow,TweenInfo.new(0.08),{BackgroundTransparency=0}):Play()
+    task.delay(0.15,function() TweenService:Create(dropRow,TweenInfo.new(0.2),{BackgroundTransparency=0.1}):Play() end)
+    task.spawn(function()
+        local so=FloatOffset local se=floatEnabled
+        FloatOffset=21 floatEnabled=true startFloat() task.wait(0.05) stopFloat()
+        FloatOffset=so floatEnabled=se if floatEnabled then startFloat() end
+    end)
+end
+dropBtn.MouseButton1Click:Connect(fireDrop)
+
+-- =============================================
+-- ESP BOX TOGGLE
+-- =============================================
+local espIsOn=espEnabled
+local espUI=makeToggleRow(content, Y.espRow, "Box ESP", C.green, espIsOn)
+espUI.keyBtn.Text="–"
+
+espUI.clickBtn.MouseButton1Click:Connect(function()
+    espIsOn=not espIsOn espEnabled=espIsOn
+    espUI.setVisual(espIsOn)
+    if espIsOn then enableEsp() else disableEsp() end
+    playSound("rbxassetid://6895079813",0.4,1)
+end)
+
+-- =============================================
+-- SAVE CONFIG BUTTON
+-- =============================================
+local saveBtn=Instance.new("TextButton",content)
+saveBtn.Size=UDim2.new(1,-8*guiScale,0,36*guiScale) saveBtn.Position=UDim2.new(0,4*guiScale,0,Y.saveBtn)
+saveBtn.BackgroundColor3=Color3.fromRGB(25,90,45) saveBtn.BackgroundTransparency=0.1
+saveBtn.BorderSizePixel=0 saveBtn.Text="💾  Save Config"
+saveBtn.TextColor3=Color3.fromRGB(200,255,210) saveBtn.Font=Enum.Font.GothamBold
+saveBtn.TextSize=13*guiScale saveBtn.ZIndex=6
+Instance.new("UICorner",saveBtn).CornerRadius=UDim.new(0,10*guiScale)
+local sbs=Instance.new("UIStroke",saveBtn) sbs.Color=C.green sbs.Thickness=1.5 sbs.Transparency=0.1
+local sbg=Instance.new("UIGradient",saveBtn) sbg.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,Color3.fromRGB(35,110,55)),ColorSequenceKeypoint.new(1,Color3.fromRGB(20,70,40))} sbg.Rotation=90
+
+local savedLbl=Instance.new("TextLabel",content)
+savedLbl.Size=UDim2.new(1,0,0,20*guiScale) savedLbl.Position=UDim2.new(0,0,0,Y.savedLbl)
+savedLbl.BackgroundTransparency=1 savedLbl.Text="✅ Config saved!"
+savedLbl.TextColor3=C.green savedLbl.Font=Enum.Font.GothamBold
+savedLbl.TextSize=11*guiScale savedLbl.TextXAlignment=Enum.TextXAlignment.Center
+savedLbl.ZIndex=6 savedLbl.TextTransparency=1
+
+saveBtn.MouseEnter:Connect(function() TweenService:Create(saveBtn,TweenInfo.new(0.12),{BackgroundTransparency=0}):Play() TweenService:Create(sbs,TweenInfo.new(0.12),{Transparency=0}):Play() end)
+saveBtn.MouseLeave:Connect(function() TweenService:Create(saveBtn,TweenInfo.new(0.12),{BackgroundTransparency=0.1}):Play() TweenService:Create(sbs,TweenInfo.new(0.12),{Transparency=0.1}):Play() end)
+saveBtn.MouseButton1Click:Connect(function()
+    saveConfig({
+        floatEnabled = floatIsOn,
+        floatOffset  = FloatOffset,
+        floatKey     = FLOAT_KEYBIND.Name,
+        dropKey      = DROP_KEYBIND.Name,
+        espEnabled   = espIsOn,
+    })
+    playSound("rbxassetid://6895079813",0.5,1.2)
+    TweenService:Create(savedLbl,TweenInfo.new(0.15),{TextTransparency=0}):Play()
+    task.delay(1.5,function() TweenService:Create(savedLbl,TweenInfo.new(0.4),{TextTransparency=1}):Play() end)
+end)
+
+-- =============================================
+-- INPUT HANDLING
+-- =============================================
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode==Enum.KeyCode.Unknown then return end
+
+    if waitingForFloatKey then
+        FLOAT_KEYBIND=input.KeyCode floatUI.keyBtn.Text=input.KeyCode.Name
+        floatUI.keyBtn.TextColor3=Color3.fromRGB(200,160,255) waitingForFloatKey=false return
+    end
+    if waitingForDropKey then
+        DROP_KEYBIND=input.KeyCode dropKeyBtn.Text=input.KeyCode.Name
+        dropKeyBtn.TextColor3=Color3.fromRGB(240,180,255) waitingForDropKey=false return
+    end
+
+    if input.KeyCode==FLOAT_KEYBIND then
+        local ns=not floatIsOn floatEnabled=ns floatUI.setVisual(ns) floatIsOn=ns
+        if ns then startFloat() else stopFloat() end
+    end
+    if input.KeyCode==DROP_KEYBIND then fireDrop() end
+end)
+
+end) -- end task.spawn GUI
