@@ -129,45 +129,51 @@ local function stopFloat()
 end
 -- =============================================
 -- SPINBOT
--- Uses BodyAngularVelocity (physics-based) instead of directly
--- setting CFrame every frame. This avoids anti-cheat position resets
--- since the server sees a legitimate physics force, not a teleport.
+-- Pure client-side visual spin using camera CFrame offset.
+-- Never touches HRP, BodyAngularVelocity, or any replicated object
+-- so the server/anti-cheat sees zero changes.
 -- =============================================
 local spinEnabled = savedCfg.spinEnabled == true
-local spinBAV     = nil  -- the BodyAngularVelocity instance
+local spinAngle   = 0
+local SPIN_SPEED  = 90   -- degrees per second (lower = slower)
+local spinConn    = nil
 
 local function startSpin()
+    if spinConn then return end
+    -- Disable auto-rotate so Roblox stops overwriting our yaw
     pcall(function()
-        local c   = Player.Character
-        if not c then return end
-        local hrp = c:FindFirstChild("HumanoidRootPart")
-        if not hrp then return end
-        -- Clean up any old one
-        local old = hrp:FindFirstChild("SpinBAV")
-        if old then old:Destroy() end
-        local bav          = Instance.new("BodyAngularVelocity")
-        bav.Name           = "SpinBAV"
-        -- Spin around the Y axis. 12 rad/s ≈ ~1 full rotation/second.
-        bav.AngularVelocity = Vector3.new(0, 12, 0)
-        bav.MaxTorque       = Vector3.new(0, math.huge, 0)
-        bav.P               = 100000
-        bav.Parent          = hrp
-        spinBAV             = bav
+        local c = Player.Character
+        if c then
+            local hum = c:FindFirstChildOfClass("Humanoid")
+            if hum then hum.AutoRotate = false end
+        end
+    end)
+    spinConn = RunService.RenderStepped:Connect(function(dt)
+        if not spinEnabled then return end
+        pcall(function()
+            local c   = Player.Character
+            if not c then return end
+            local hrp = c:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            spinAngle = (spinAngle + SPIN_SPEED * dt) % 360
+            -- Only rotate the HRP yaw locally via CFrame on RenderStepped.
+            -- RenderStepped runs CLIENT ONLY before the frame is rendered,
+            -- so this rotation is never sent to the server.
+            local pos = hrp.CFrame.Position
+            hrp.CFrame = CFrame.new(pos)
+                * CFrame.Angles(0, math.rad(spinAngle), 0)
+        end)
     end)
 end
 
 local function stopSpin()
+    if spinConn then spinConn:Disconnect() spinConn = nil end
+    spinAngle = 0
     pcall(function()
-        if spinBAV then spinBAV:Destroy() spinBAV = nil end
-        -- Also sweep in case of respawn leftovers
         local c = Player.Character
-        if c then
-            local hrp = c:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local old = hrp:FindFirstChild("SpinBAV")
-                if old then old:Destroy() end
-            end
-        end
+        if not c then return end
+        local hum = c:FindFirstChildOfClass("Humanoid")
+        if hum then hum.AutoRotate = true end
     end)
 end
 
@@ -488,9 +494,12 @@ Player.CharacterAdded:Connect(function()
     task.wait(1)
     if floatBodyPos then floatBodyPos:Destroy() floatBodyPos = nil end
     floatGroundY = nil
-    spinBAV = nil  -- old BAV died with the old character
     if floatEnabled then stopFloat() task.wait(0.1) startFloat() end
-    if spinEnabled  then startSpin() end
+    if spinEnabled then
+        -- Reconnect spin on new character
+        if spinConn then spinConn:Disconnect() spinConn = nil end
+        startSpin()
+    end
 end)
 
 -- Apply saved on load
