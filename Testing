@@ -34,7 +34,6 @@ local savedCfg = loadConfig()
 -- =============================================
 local FLOAT_KEYBIND  = Enum.KeyCode[savedCfg.floatKey  or "G"] or Enum.KeyCode.G
 local DROP_KEYBIND   = Enum.KeyCode[savedCfg.dropKey   or "F"] or Enum.KeyCode.F
-local SPIN_KEYBIND   = Enum.KeyCode[savedCfg.spinKey   or "H"] or Enum.KeyCode.H
 local NOANIM_KEYBIND = Enum.KeyCode[savedCfg.noanimKey or "J"] or Enum.KeyCode.J
 
 -- =============================================
@@ -128,46 +127,6 @@ local function stopFloat()
     end)
 end
 -- =============================================
--- SPINBOT
--- Pure client-side visual spin using camera CFrame offset.
--- Never touches HRP, BodyAngularVelocity, or any replicated object
--- so the server/anti-cheat sees zero changes.
--- =============================================
-local spinEnabled = savedCfg.spinEnabled == true
-local spinAngle   = 0
-local SPIN_SPEED  = 90   -- degrees per second (lower = slower)
-local spinConn    = nil
-
-local function startSpin()
-    if spinConn then return end
-    -- Disable auto-rotate so Roblox stops overwriting our yaw
-    pcall(function()
-        local c = Player.Character
-        if c then
-            local hum = c:FindFirstChildOfClass("Humanoid")
-            if hum then hum.AutoRotate = false end
-        end
-    end)
-    spinConn = RunService.RenderStepped:Connect(function(dt)
-        if not spinEnabled then return end
-        pcall(function()
-            local c   = Player.Character
-            if not c then return end
-            local hrp = c:FindFirstChild("HumanoidRootPart")
-            if not hrp then return end
-            spinAngle = (spinAngle + SPIN_SPEED * dt) % 360
-            -- Only rotate the HRP yaw locally via CFrame on RenderStepped.
-            -- RenderStepped runs CLIENT ONLY before the frame is rendered,
-            -- so this rotation is never sent to the server.
-            local pos = hrp.CFrame.Position
-            hrp.CFrame = CFrame.new(pos)
-                * CFrame.Angles(0, math.rad(spinAngle), 0)
-        end)
-    end)
-end
-
-local function stopSpin()
-    if spinConn then spinConn:Disconnect() spinConn = nil end
     spinAngle = 0
     pcall(function()
         local c = Player.Character
@@ -495,11 +454,6 @@ Player.CharacterAdded:Connect(function()
     if floatBodyPos then floatBodyPos:Destroy() floatBodyPos = nil end
     floatGroundY = nil
     if floatEnabled then stopFloat() task.wait(0.1) startFloat() end
-    if spinEnabled then
-        -- Reconnect spin on new character
-        if spinConn then spinConn:Disconnect() spinConn = nil end
-        startSpin()
-    end
 end)
 
 -- Apply saved on load
@@ -509,9 +463,6 @@ if savedCfg.floatEnabled then
 end
 if espEnabled then
     task.delay(2, function() if espEnabled then enableEsp() end end)
-end
-if spinEnabled then
-    task.delay(2, function() if spinEnabled then startSpin() end end)
 end
 if noAnimEnabled then
     task.delay(2, function() if noAnimEnabled then enableNoAnim() end end)
@@ -549,7 +500,7 @@ end
 -- PANEL
 -- =============================================
 local TITLE_H = 38
-local PANEL_H = 470
+local PANEL_H = 418
 local collapsed = false
 
 local panel = Instance.new("Frame", sg)
@@ -738,10 +689,9 @@ local Y = {
     floatSlider = 86,
     dropRow     = 152,
     espRow      = 200,
-    spinRow     = 252,
-    noanimRow   = 304,
-    saveBtn     = 358,
-    savedLbl    = 400,
+    noanimRow   = 252,
+    saveBtn     = 306,
+    savedLbl    = 348,
 }
 
 -- =============================================
@@ -903,25 +853,6 @@ espUI.clickBtn.MouseButton1Click:Connect(function()
     playSound("rbxassetid://6895079813",0.4,1)
 end)
 
--- =============================================
--- SPINBOT TOGGLE
--- =============================================
-local spinIsOn=spinEnabled
-local spinUI=makeToggleRow(content, Y.spinRow, "Spin Bot", C.purple, spinIsOn)
-local waitingForSpinKey=false
-spinUI.keyBtn.Text=SPIN_KEYBIND.Name
-spinUI.keyBtn.MouseButton1Click:Connect(function()
-    waitingForSpinKey=true spinUI.keyBtn.Text="..." spinUI.keyBtn.TextColor3=Color3.fromRGB(255,220,80)
-    playSound("rbxassetid://6895079813",0.3,1.5)
-end)
-spinUI.keyBtn.MouseEnter:Connect(function() if not waitingForSpinKey then TweenService:Create(spinUI.keyBtn,TweenInfo.new(0.1),{BackgroundTransparency=0}):Play() end end)
-spinUI.keyBtn.MouseLeave:Connect(function() if not waitingForSpinKey then TweenService:Create(spinUI.keyBtn,TweenInfo.new(0.1),{BackgroundTransparency=0.4}):Play() end end)
-spinUI.clickBtn.MouseButton1Click:Connect(function()
-    spinIsOn=not spinIsOn spinEnabled=spinIsOn
-    spinUI.setVisual(spinIsOn)
-    if spinIsOn then startSpin() else stopSpin() end
-    playSound("rbxassetid://6895079813",0.4,1)
-end)
 
 -- =============================================
 -- NO ANIM TOGGLE
@@ -972,8 +903,6 @@ saveBtn.MouseButton1Click:Connect(function()
         floatKey      = FLOAT_KEYBIND.Name,
         dropKey       = DROP_KEYBIND.Name,
         espEnabled    = espIsOn,
-        spinEnabled   = spinIsOn,
-        spinKey       = SPIN_KEYBIND.Name,
         noAnimEnabled = noanimIsOn,
         noanimKey     = NOANIM_KEYBIND.Name,
     })
@@ -997,10 +926,6 @@ UserInputService.InputBegan:Connect(function(input, gpe)
         DROP_KEYBIND=input.KeyCode dropKeyBtn.Text=input.KeyCode.Name
         dropKeyBtn.TextColor3=Color3.fromRGB(240,180,255) waitingForDropKey=false return
     end
-    if waitingForSpinKey then
-        SPIN_KEYBIND=input.KeyCode spinUI.keyBtn.Text=input.KeyCode.Name
-        spinUI.keyBtn.TextColor3=Color3.fromRGB(200,160,255) waitingForSpinKey=false return
-    end
     if waitingForNoanimKey then
         NOANIM_KEYBIND=input.KeyCode noanimUI.keyBtn.Text=input.KeyCode.Name
         noanimUI.keyBtn.TextColor3=Color3.fromRGB(200,160,255) waitingForNoanimKey=false return
@@ -1011,9 +936,6 @@ UserInputService.InputBegan:Connect(function(input, gpe)
         if ns then startFloat() else stopFloat() end
     end
     if input.KeyCode==DROP_KEYBIND then fireDrop() end
-    if input.KeyCode==SPIN_KEYBIND then
-        local ns=not spinIsOn spinEnabled=ns spinUI.setVisual(ns) spinIsOn=ns
-        if ns then startSpin() else stopSpin() end
     end
     if input.KeyCode==NOANIM_KEYBIND then
         local ns=not noanimIsOn noAnimEnabled=ns noanimUI.setVisual(ns) noanimIsOn=ns
