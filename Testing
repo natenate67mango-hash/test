@@ -129,27 +129,46 @@ local function stopFloat()
 end
 -- =============================================
 -- SPINBOT
+-- Uses BodyAngularVelocity (physics-based) instead of directly
+-- setting CFrame every frame. This avoids anti-cheat position resets
+-- since the server sees a legitimate physics force, not a teleport.
 -- =============================================
 local spinEnabled = savedCfg.spinEnabled == true
-local spinConn    = nil
-local SPIN_SPEED  = 20  -- degrees per frame (~360°/s at 60fps)
+local spinBAV     = nil  -- the BodyAngularVelocity instance
 
 local function startSpin()
-    if spinConn then return end
-    spinConn = RunService.Heartbeat:Connect(function()
-        if not spinEnabled then return end
-        pcall(function()
-            local c   = Player.Character
-            if not c then return end
-            local hrp = c:FindFirstChild("HumanoidRootPart")
-            if not hrp then return end
-            hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(SPIN_SPEED), 0)
-        end)
+    pcall(function()
+        local c   = Player.Character
+        if not c then return end
+        local hrp = c:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        -- Clean up any old one
+        local old = hrp:FindFirstChild("SpinBAV")
+        if old then old:Destroy() end
+        local bav          = Instance.new("BodyAngularVelocity")
+        bav.Name           = "SpinBAV"
+        -- Spin around the Y axis. 12 rad/s ≈ ~1 full rotation/second.
+        bav.AngularVelocity = Vector3.new(0, 12, 0)
+        bav.MaxTorque       = Vector3.new(0, math.huge, 0)
+        bav.P               = 100000
+        bav.Parent          = hrp
+        spinBAV             = bav
     end)
 end
 
 local function stopSpin()
-    if spinConn then spinConn:Disconnect() spinConn = nil end
+    pcall(function()
+        if spinBAV then spinBAV:Destroy() spinBAV = nil end
+        -- Also sweep in case of respawn leftovers
+        local c = Player.Character
+        if c then
+            local hrp = c:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local old = hrp:FindFirstChild("SpinBAV")
+                if old then old:Destroy() end
+            end
+        end
+    end)
 end
 
 -- =============================================
@@ -469,7 +488,9 @@ Player.CharacterAdded:Connect(function()
     task.wait(1)
     if floatBodyPos then floatBodyPos:Destroy() floatBodyPos = nil end
     floatGroundY = nil
+    spinBAV = nil  -- old BAV died with the old character
     if floatEnabled then stopFloat() task.wait(0.1) startFloat() end
+    if spinEnabled  then startSpin() end
 end)
 
 -- Apply saved on load
